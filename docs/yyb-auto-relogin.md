@@ -74,3 +74,31 @@ QQ 登录（QQ扫码 / NapCat）已移除，账号创建时固定写入 `platfor
 - `PUSHPLUS_TOKEN`：存在时自动注入并启用 PushPlus 渠道，自动重连失败时默认用它推送二维码。
 - `RENDER_EXTERNAL_URL`：Render 自动注入，用于拼接二维码公开地址。
 - `PUBLIC_BASE_URL`：自建部署时手动指定公网地址，例如 `https://farm.example.com`。
+
+## 网络链路与排障
+
+扫码回登整条链路会访问四个域名，任何一个不通都会在日志里表现为失败：
+
+| 阶段 | 域名 | 协议 |
+| --- | --- | --- |
+| 生成二维码 / 轮询扫码状态 | `open.weixin.qq.com`、`long.open.weixin.qq.com` | HTTPS |
+| 换 `login_buffer`、拉用户信息 | `yybadaccess.3g.qq.com` | HTTPS |
+| 查微信云分发节点 | `aedns.weixin.qq.com` | HTTPS（上游写死明文 HTTP，已改为优先 HTTPS） |
+| 换游戏 Code | `shortcloud.weixin.com` | 明文 HTTP（自定义协议） |
+
+海外机器（Render 新加坡等）最常见的问题是 `aedns` 那条请求（上游原本写死明文 HTTP）和 DNS 抖动；Node 的 `fetch` 只会抛 `TypeError: fetch failed`，真正的原因在 `error.cause` 里，以前日志把它丢掉了。
+
+现在 `core/src/services/wx-login/net.ts` 会：
+
+1. 保留真实错误码（`ENOTFOUND` / `ECONNRESET` / `ETIMEDOUT` / `UND_ERR_*`），日志形如
+   `扫码后自动登录失败（第 1 次）: 网络请求失败 aedns.weixin.qq.com [fetch#1:ECONNRESET syscall=read ...]`；
+2. 网络层失败先重试 2 次，再按「系统 DNS → DoH（Google / Cloudflare）→ 内置兜底 IP」解析，
+   用解析出的 IP 直连并保持域名 SNI 与 `Host` 头；
+3. 扫码换票失败时保留当前二维码，最多重试 5 次（退避 1.5s、3s、4.5s、6s），不再一次失败就作废。
+
+常见错误码对应处理：
+
+- `ENOTFOUND` / `EAI_AGAIN`：DNS 问题，已是 DoH + 固定 IP 兜底，仍失败说明出口 DNS 被劫持，改用自建解析或代理；
+- `ECONNRESET` / `ETIMEDOUT`：出口 IP 被对端重置，确认机器地区是否被限制，必要时给 `core` 进程加代理；
+- `HTTP 401/403` 且 body 带 `40188 invalid scope`：凭据失效，属正常路径，等扫码换新凭据即可；
+- `socket timeout`：明文 HTTP 端口不通，检查平台是否封了 80 端口。

@@ -1,5 +1,6 @@
 import type { Account, WxCredential } from '../types/account';
 import { getNativeWxLoginCode } from '../services/wx-login/native-protocol';
+import { describeError } from '../services/wx-login/net';
 import { wxLoginTaskManager } from '../services/wx-login/task-manager';
 import type { LoginTask } from '../services/wx-login/task-manager';
 const { CONFIG } = require('../config/config');
@@ -40,6 +41,10 @@ interface ReloginState {
     startedAt: number;
     cancelled: boolean;
     scanTaskId?: string;
+    /** 已完成的换票次数，用于网络抖动时重试而不是直接作废二维码。 */
+    confirmAttempts?: number;
+    /** HTTP 换票（login_buffer）是否已成功，成功后不再重复调用。 */
+    confirmed?: boolean;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -199,8 +204,14 @@ function createAutoReloginService(deps: AutoReloginDeps) {
                 return;
             }
             if (status === 'authorized') {
+                state.confirmAttempts = (state.confirmAttempts || 0) + 1;
                 try {
-                    await wxLoginTaskManager.confirm(task.id);
+                    // 换票分两步：HTTP 换 login_buffer，再用 native 协议换 Code。
+                    // 网络抖动时不要作废二维码，保留会话重试几次。
+                    if (!state.confirmed) {
+                        await wxLoginTaskManager.confirm(task.id);
+                        state.confirmed = true;
+                    }
                     const result = await wxLoginTaskManager.issueCode(task.id, TARGET_APP_ID);
                     const credential = wxLoginTaskManager.credentialFromTask(task);
                     const account = findAccount(store, state.accountId);
@@ -213,8 +224,16 @@ function createAutoReloginService(deps: AutoReloginDeps) {
                     log('系统', `账号 ${state.accountName} 扫码重登成功`, { accountId: state.accountId });
                     addAccountLog('auto_relogin', `扫码重登成功: ${state.accountName}`, state.accountId, state.accountName, { source: 'wx_scan' });
                 } catch (error: any) {
-                    log('错误', `扫码后自动登录失败: ${error.message}`, { accountId: state.accountId });
-                    addAccountLog('auto_relogin', `扫码后自动登录失败: ${error.message}`, state.accountId, state.accountName, { source: 'wx_scan' });
+                    const detail = describeError(error);
+                    log('错误', `扫码后自动登录失败（第 ${state.confirmAttempts} 次）: ${detail}`, { accountId: state.accountId });
+                    addAccountLog('auto_relogin', `扫码后自动登录失败（第 ${state.confirmAttempts} 次）: ${detail}`, state.accountId, state.accountName, { source: 'wx_scan' });
+                    if (state.confirmAttempts >= 5) {
+                        log('错误', `扫码换票连续失败，请到管理面板重新扫码: ${state.accountName}`, { accountId: state.accountId });
+                        addAccountLog('auto_relogin', `扫码换票连续失败，需要重新扫码: ${state.accountName}`, state.accountId, state.accountName, {});
+                        return;
+                    }
+                    await sleep(1500 * state.confirmAttempts);
+                    continue;
                 }
                 return;
             }

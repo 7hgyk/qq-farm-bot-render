@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import net from 'node:net';
+import { describeError, requestWithFallback } from './net';
 
 type Target = { ip: string; port: number };
 type Session = { sendKey: Buffer; recvKey: Buffer; f9: Buffer; uin: bigint; deviceId: Buffer; hostAppId: Buffer; psk: Buffer; ticket: Buffer };
@@ -96,7 +97,39 @@ function parseManual(body: Buffer, temp: any) {
 }
 function jsPlain(uin: bigint, appId: string, host: Buffer) { const mac = crypto.randomBytes(6); mac[0] = (mac[0] | 0x02) & 0xFE; const dev = U8(mac.toString('hex').match(/../g)!.join('-').toUpperCase()); const uin32 = BigInt.asUintN(32, uin); const info = (name: string) => Buffer.concat([pbl(1, U8('sessionkey')), pbv(2, uin32), pbl(3, dev), pbv(4, 1661404927), pbl(5, U8(name)), pbv(6, 0)]); const req = Buffer.concat([pbl(1, info('UnifiedPCWindows')), pbl(2, U8(appId)), pbv(4, 1), pbl(5, Buffer.alloc(0)), pbl(6, Buffer.alloc(0)), pbv(7, 1)]); return Buffer.concat([pbl(1, info('Windows')), pbl(2, U8('/cgi-bin/mmbiz-bin/js-login')), pbl(3, host), pbv(4, 5), pbl(5, req), pbl(6, U8(appId)), pbv(7, 1029), pbv(8, 1610627409), pbl(9, U8('WindowsxWebPlugin')), pbv(10, 573651281)]); }
 function envelope(s: Session, plain: Buffer) { const enc = layout(s.sendKey, lz4Literal(plain)); const head = wpkg({ 1: 1, 2: s.uin, 3: 0, 4: 0, 5: 524545, 6: 11, 7: 0, 8: 0, 9: 0, 10: 1, 11: 0, 12: 0, 13: 0, 17: 0, 18: 1, 20: 1504, 21: 0, 22: s.uin, 23: 0, 25: 16, 26: 4, 28: 1, 29: 1, 30: 0 }, { 14: Buffer.alloc(0), 24: s.deviceId, 27: s.f9 }); const inner = short(0x0B41, 0, Buffer.concat([head, enc])); const b = Buffer.concat([Buffer.alloc(2), TRANSFER_PATH, Buffer.alloc(2), TRANSFER_HOST, Buffer.alloc(4), inner]); b.writeUInt16BE(TRANSFER_PATH.length); b.writeUInt16BE(TRANSFER_HOST.length, 2 + TRANSFER_PATH.length); b.writeUInt32BE(inner.length, 4 + TRANSFER_PATH.length + TRANSFER_HOST.length); const n = Buffer.alloc(4); n.writeUInt32BE(b.length); return Buffer.concat([n, b]); }
-async function targets(kind: 'long' | 'short') { const r = await fetch('http://aedns.weixin.qq.com/cgi-bin/default/getdns?clientversion=0&devicetype=Windows&uin=0&format=json', { headers: { 'User-Agent': 'MicroMessenger Client' } }); const d: any = await r.json(); const item = d?.dns?.domainlist?.find((x: any) => x.name === (kind === 'long' ? 'longcloud.weixin.com' : 'shortcloud.weixin.com')); const proto = kind === 'long' ? 'mmtlsovertcp' : 'http'; const ports = item?.protocollist?.find((x: any) => x.name === proto)?.portlist || []; const ips = (item?.iplist || []).map((x: any) => x.ip); const out = ips.flatMap((ip: string) => ports.map((port: number) => ({ ip, port }))); return out.length ? out : [{ ip: kind === 'long' ? '180.153.202.85' : '120.241.131.173', port: kind === 'long' ? 8080 : 80 }]; }
+const AEDNS_PATH = '/cgi-bin/default/getdns?clientversion=0&devicetype=Windows&uin=0&format=json';
+
+/**
+ * 查微信云分发节点。
+ * 上游这里写死的是明文 http（早期客户端行为），但该域名同样支持 https，
+ * 海外出口对 80 端口/明文请求更容易被中间设备打断，所以优先 https，失败再回落 http。
+ */
+async function aednsLookup(): Promise<any> {
+    const headers = { 'user-agent': 'MicroMessenger Client' };
+    const attempts: string[] = [];
+    let lastError: any;
+    for (const scheme of ['https', 'http']) {
+        try {
+            const response = await requestWithFallback(`${scheme}://aedns.weixin.qq.com${AEDNS_PATH}`, { headers, timeoutMs: 15000 });
+            if (response.status >= 200 && response.status < 300) return JSON.parse(response.body.toString('utf8'));
+            attempts.push(`${scheme} HTTP ${response.status}`);
+        } catch (error: any) {
+            lastError = error;
+            attempts.push(`${scheme} ${describeError(error)}`);
+        }
+    }
+    throw new Error(`aedns lookup failed [${attempts.join(' | ')}]`, { cause: lastError });
+}
+
+async function targets(kind: 'long' | 'short') {
+    const d = await aednsLookup();
+    const item = d?.dns?.domainlist?.find((x: any) => x.name === (kind === 'long' ? 'longcloud.weixin.com' : 'shortcloud.weixin.com'));
+    const proto = kind === 'long' ? 'mmtlsovertcp' : 'http';
+    const ports = item?.protocollist?.find((x: any) => x.name === proto)?.portlist || [];
+    const ips = (item?.iplist || []).map((x: any) => x.ip);
+    const out = ips.flatMap((ip: string) => ports.map((port: number) => ({ ip, port })));
+    return out.length ? out : [{ ip: kind === 'long' ? '180.153.202.85' : '120.241.131.173', port: kind === 'long' ? 8080 : 80 }];
+}
 
 export async function getNativeWxLoginCode(loginBuffer: string, appId: string): Promise<string> {
     const { req, device, host } = manualRequest(loginBuffer, crypto.randomBytes(32));

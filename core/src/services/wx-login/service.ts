@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { getNativeWxLoginCode } from './native-protocol';
+import { requestWithFallback } from './net';
 
 const QR_CONNECT_URL = 'https://open.weixin.qq.com/connect/qrconnect';
 const QR_IMAGE_BASE = 'https://open.weixin.qq.com/connect/qrcode/';
@@ -61,32 +62,33 @@ function storeCookies(cookies: Map<string, string>, headers: Headers): void {
 }
 
 async function request(url: string, cookies: Map<string, string>, init: RequestInit = {}, timeout = 35_000): Promise<HttpResult> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
-    try {
-        let currentUrl = url;
-        let method = init.method || 'GET';
-        let body = init.body;
-        for (let redirects = 0; redirects <= 5; redirects++) {
-            const headers = new Headers(init.headers);
-            headers.set('User-Agent', USER_AGENT);
-            if (cookies.size) headers.set('Cookie', cookieHeader(cookies));
-            const response = await fetch(currentUrl, { ...init, method, body, headers, redirect: 'manual', signal: controller.signal });
-            storeCookies(cookies, response.headers);
-            const location = response.headers.get('location');
-            if (response.status < 300 || response.status >= 400 || !location) {
-                return { status: response.status, body: Buffer.from(await response.arrayBuffer()), headers: response.headers };
-            }
-            currentUrl = new URL(location, currentUrl).toString();
-            if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
-                method = 'GET';
-                body = undefined;
-            }
+    let currentUrl = url;
+    let method = init.method || 'GET';
+    let body = init.body;
+    for (let redirects = 0; redirects <= 5; redirects++) {
+        const headers = new Headers(init.headers as any);
+        headers.set('User-Agent', USER_AGENT);
+        if (cookies.size) headers.set('Cookie', cookieHeader(cookies));
+        // fetch 网络层失败时 requestWithFallback 会重试并按 IP 直连兜底，
+        // 抛出的错误里带有 ENOTFOUND / ECONNRESET 这类真实原因。
+        const response = await requestWithFallback(currentUrl, {
+            method,
+            headers,
+            body: typeof body === 'string' || Buffer.isBuffer(body) ? body : undefined,
+            timeoutMs: timeout,
+        });
+        storeCookies(cookies, response.headers);
+        const location = response.headers.get('location');
+        if (response.status < 300 || response.status >= 400 || !location) {
+            return { status: response.status, body: response.body, headers: response.headers };
         }
-        throw new Error('Too many redirects while contacting WeChat');
-    } finally {
-        clearTimeout(timer);
+        currentUrl = new URL(location, currentUrl).toString();
+        if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+            method = 'GET';
+            body = undefined;
+        }
     }
+    throw new Error('Too many redirects while contacting WeChat');
 }
 
 function requiredCookie(cookies: Map<string, string>, name: string): string {
