@@ -1,0 +1,38 @@
+# Render Blueprint：在 Render 控制台 New > Blueprint 选择本仓库即可创建服务。
+# 变量值请在 Render 控制台填写；标记 sync: false 的变量不会写入仓库。
+services:
+  - type: web
+    name: qq-farm-bot
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: TZ
+        value: Asia/Shanghai
+      - key: NODE_ENV
+        value: production
+      # 避免平台或历史配置注入 --require tsx/cjs 之类的预加载参数。
+      # 生产镜像直接运行编译后的 JS，不需要任何 loader。
+      - key: NODE_OPTIONS
+        value: ""
+      # 数据目录。Render 免费实例的磁盘是临时的，重启/重新部署会清空；
+      # 想保留账号和配置，请升级到带持久磁盘的实例，并在下方挂载磁盘后保持此路径。
+      - key: FARM_DATA_DIR
+        value: /app/core/data
+      # 管理员账号：设置后优先于 data/admin.json，登录不再强制改密码。
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      # PushPlus 推送 Token：设置后自动注入并启用 PushPlus 渠道。
+      - key: PUSHPLUS_TOKEN
+        sync: false
+    # 持久磁盘需要付费实例，按需取消注释：
+    # disk:
+    #   name: qq-farm-data
+    #   mountPath: /app/core/data
+    #   sizeGB: 1
