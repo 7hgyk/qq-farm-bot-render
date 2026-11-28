@@ -6,7 +6,7 @@ const store = require('../models/store');
 const { updateRuntimeConfig } = require('../config/config');
 const { sendPushooMessage } = require('../services/push');
 const { createDataProvider } = require('./data-provider');
-const { createReloginReminderService } = require('./relogin-reminder');
+const { createReloginReminderService, shouldSkipOfflineReminder } = require('./relogin-reminder');
 const { createAutoReloginService } = require('./auto-relogin');
 const { createRuntimeState } = require('./runtime-state');
 const { createWorkerManager } = require('./worker-manager');
@@ -67,9 +67,29 @@ function createRuntimeEngine(options: RuntimeEngineOptions = {}) {
 
     const {
         getOfflineAutoDeleteMs,
-        triggerOfflineReminder,
+        triggerOfflineReminder: sendOfflineReminder,
         sendConfiguredPush,
     } = reloginReminder;
+
+    /**
+     * 掉线提醒去重：自动重连开着时，掉线会走「重连失败 → 推送二维码」，
+     * 再发一条下线提醒就会重复。这里只跳过掉线/被踢两条链路，
+     * 离线超时自动删除等其他提醒照常发送。
+     */
+    function triggerOfflineReminder(payload: any = {}): void {
+        const reason = String(payload?.reason || '');
+        let reloginEnabled = false;
+        try {
+            reloginEnabled = Boolean(store.getAutoRelogin?.().enabled);
+        } catch {
+            reloginEnabled = false;
+        }
+        if (shouldSkipOfflineReminder(reason, reloginEnabled)) {
+            log('系统', `账号 ${payload.accountName || payload.accountId || ''} 掉线，自动重连已开启，跳过下线提醒推送`, { accountId: payload.accountId });
+            return;
+        }
+        void sendOfflineReminder(payload);
+    }
 
     // 自动重连服务要在 worker manager 之后创建，但 manager 的掉线回调需要它，
     // 因此用闭包先引用可变变量。

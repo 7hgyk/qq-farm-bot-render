@@ -16,6 +16,15 @@ interface OfflineReminderPayload {
     offlineMs?: number;
 }
 
+/**
+ * 自动重连开启时，被踢下线 / 连接断开这两条提醒由「重连失败推送二维码」承担，
+ * 再发一条下线提醒就重复了；离线超时自动删除等其他提醒仍要照常发送。
+ */
+export function shouldSkipOfflineReminder(reason: string, reloginEnabled: boolean): boolean {
+    if (!reloginEnabled) return false;
+    return /^(kickout|disconnect):/.test(String(reason || ''));
+}
+
 function createReloginReminderService(options: ReloginReminderOptions) {
     const { store, sendPushooMessage, log } = options;
 
@@ -88,4 +97,4 @@ function createReloginReminderService(options: ReloginReminderOptions) {
     return { getOfflineAutoDeleteMs, triggerOfflineReminder, sendConfiguredPush };
 }
 
-module.exports = { createReloginReminderService };
+module.exports = { createReloginReminderService, shouldSkipOfflineReminder };

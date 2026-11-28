@@ -47,6 +47,22 @@ interface ReloginState {
     confirmed?: boolean;
 }
 
+/** 凭据彻底失效的错误：重试多少次都没用，直接换二维码。 */
+const FATAL_CREDENTIAL_PATTERNS: RegExp[] = [
+    /invalid scope/i,
+    /\[40188\]/,
+    /Login buffer rejected: code=-101/i,
+    /Refresh token rejected/i,
+    /没有应用宝扫码凭据/,
+    /缺少应用宝 refresh_token/,
+];
+
+function isFatalCredentialError(message: string): boolean {
+    const text = String(message || '');
+    if (!text) return false;
+    return FATAL_CREDENTIAL_PATTERNS.some(pattern => pattern.test(text));
+}
+
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -139,7 +155,9 @@ function createAutoReloginService(deps: AutoReloginDeps) {
         let loginBuffer = '';
         try {
             loginBuffer = await service.fetchLoginBuffer(credential);
-        } catch (error) {
+        } catch (error: any) {
+            // 凭据已被判定失效（invalid scope）时，刷新也救不回来，直接抛给上层换码。
+            if (isFatalCredentialError(String(error?.message || error))) throw error;
             if (!credential.refreshToken) throw error;
             credential = await service.refreshCredential(credential);
             persistCredential(account.id, credential);
@@ -165,7 +183,7 @@ function createAutoReloginService(deps: AutoReloginDeps) {
         const base = publicBaseUrl();
         const panel = base.startsWith('http://127.0.0.1') ? '' : `\n\n[打开管理面板](${base}/)`;
         const content = [
-            `账号 **${account.name}** 已掉线，自动重连 3 次失败，请在 5 分钟内扫码重新登录。`,
+            `账号 **${account.name}** 已掉线，自动重连未成功，请在 5 分钟内扫码重新登录。`,
             '',
             `![扫码登录](${qrUrl})`,
             panel,
@@ -301,6 +319,13 @@ function createAutoReloginService(deps: AutoReloginDeps) {
                 lastError = String(error?.message || error || 'unknown');
                 log('错误', `账号 ${account.name} 自动重连失败（第 ${index + 1} 次）: ${lastError}`, { accountId: account.id, attempt: index + 1 });
                 addAccountLog('auto_relogin', `自动重连失败（第 ${index + 1} 次）: ${lastError}`, account.id, account.name, { attempt: index + 1 });
+                if (isFatalCredentialError(lastError)) {
+                    // 凭据已彻底失效，后面几次注定失败，直接进扫码流程。
+                    const skipped = Math.max(0, intervals.length - index - 1);
+                    log('系统', `账号 ${account.name} 凭据已失效，跳过剩余 ${skipped} 次重试，直接生成登录二维码`, { accountId: account.id });
+                    addAccountLog('auto_relogin', `凭据已失效，跳过剩余重试直接生成二维码: ${account.name}`, account.id, account.name, { reason: lastError, skipped });
+                    break;
+                }
             }
         }
         if (state.cancelled) return;

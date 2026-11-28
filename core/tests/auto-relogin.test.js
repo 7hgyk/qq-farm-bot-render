@@ -69,3 +69,27 @@ test('auto relogin does nothing when disabled in settings', async () => {
     assert.equal(logs.filter(line => line.includes('自动重连失败')).length, 0);
     assert.ok(logs.some(line => line.includes('自动重连已关闭')));
 });
+
+test('fatal credential errors skip the remaining retries and go straight to a QR code', async () => {
+    const originalRefresh = wxLoginTaskManager.service.refreshCredential;
+    const originalBuffer = wxLoginTaskManager.service.fetchLoginBuffer;
+    const originalCreate = wxLoginTaskManager.createTask;
+    let createCalls = 0;
+    wxLoginTaskManager.service.refreshCredential = async () => { throw new Error('refresh rejected'); };
+    wxLoginTaskManager.service.fetchLoginBuffer = async () => {
+        throw new Error('Login buffer rejected: code=-101 GetLoginBuffer error [40188] [invalid scope, rid: test] || [0] []');
+    };
+    wxLoginTaskManager.createTask = async () => { createCalls += 1; throw new Error('qr offline'); };
+    const { logs, service } = buildHarness();
+    try {
+        service.schedule({ accountId: '9', accountName: '测试号', reason: 'disconnect:test' });
+        await new Promise(resolve => setTimeout(resolve, 2200));
+        assert.equal(logs.filter(line => line.includes('自动重连失败（第')).length, 1, '凭据失效时只尝试一次');
+        assert.ok(logs.some(line => line.includes('跳过剩余')), '应记录跳过剩余重试');
+        assert.equal(createCalls, 1, '应立刻进入二维码流程');
+    } finally {
+        wxLoginTaskManager.service.refreshCredential = originalRefresh;
+        wxLoginTaskManager.service.fetchLoginBuffer = originalBuffer;
+        wxLoginTaskManager.createTask = originalCreate;
+    }
+});
